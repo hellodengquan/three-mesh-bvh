@@ -163,12 +163,157 @@ export class SkinnedMeshBVH extends GeometryBVH {
 
 		const { matrixWorld } = object;
 		const { firstHitOnly } = raycaster;
+		const { geometry } = this;
 
 		_inverseMatrix.copy( matrixWorld ).invert();
 		_ray.copy( raycaster.ray ).applyMatrix4( _inverseMatrix );
 
 		let closestHit = null;
 		let closestDistance = Infinity;
+
+		// performs the ray triangle intersection using the given material side and
+		// accumulates a hit result with the given material index if it succeeds
+		const checkTriangle = ( tri, triIndex, side, materialIndex ) => {
+
+			// get the intersection
+			let point = null;
+			if ( side === FrontSide ) {
+
+				point = _ray.intersectTriangle( tri.a, tri.b, tri.c, true, _localPoint );
+
+			} else if ( side === BackSide ) {
+
+				point = _ray.intersectTriangle( tri.c, tri.b, tri.a, true, _localPoint );
+
+			} else {
+
+				point = _ray.intersectTriangle( tri.a, tri.b, tri.c, false, _localPoint );
+
+			}
+
+			if ( ! point ) {
+
+				return;
+
+			}
+
+			// transform it into world space
+			point = point.clone().applyMatrix4( matrixWorld );
+
+			// check distance to ray
+			const dist = raycaster.ray.origin.distanceTo( point );
+			if ( dist >= raycaster.near && dist <= raycaster.far ) {
+
+				if ( firstHitOnly && dist >= closestDistance ) {
+
+					return;
+
+				}
+
+				// get the vertex indices
+				const { index } = geometry;
+				const actualTri = this.resolvePrimitiveIndex( triIndex );
+				const triOffset = actualTri * 3;
+
+				let ai = triOffset + 0;
+				let bi = triOffset + 1;
+				let ci = triOffset + 2;
+
+				if ( index ) {
+
+					ai = index.array[ ai ];
+					bi = index.array[ bi ];
+					ci = index.array[ ci ];
+
+				}
+
+				// build the intersection result
+				const hit = {
+					distance: dist,
+					point: point.clone(),
+					object,
+					uv: null,
+					uv1: null,
+					normal: null,
+					face: {
+						a: ai,
+						b: bi,
+						c: ci,
+						normal: Triangle.getNormal( tri.a, tri.b, tri.c, new Vector3() ),
+						materialIndex: materialIndex
+					},
+					faceIndex: actualTri,
+				};
+
+				if ( IS_GT_REVISION_169 ) {
+
+					const barycoord = new Vector3();
+					Triangle.getBarycoord( _localPoint, tri.a, tri.b, tri.c, barycoord );
+					hit.barycoord = barycoord;
+
+				}
+
+				// add attribute fields if available
+				const uv = geometry.attributes.uv;
+				const uv1 = geometry.attributes.uv1;
+				const normal = geometry.attributes.normal;
+
+				if ( uv ) {
+
+					_uvA.fromBufferAttribute( uv, ai );
+					_uvB.fromBufferAttribute( uv, bi );
+					_uvC.fromBufferAttribute( uv, ci );
+
+					hit.uv = new Vector2();
+					const resUv = Triangle.getInterpolation( _localPoint, tri.a, tri.b, tri.c, _uvA, _uvB, _uvC, hit.uv );
+					if ( ! IS_GT_REVISION_169 ) hit.uv = resUv;
+
+				}
+
+				if ( uv1 ) {
+
+					_uvA.fromBufferAttribute( uv1, ai );
+					_uvB.fromBufferAttribute( uv1, bi );
+					_uvC.fromBufferAttribute( uv1, ci );
+
+					hit.uv1 = new Vector2();
+					const resUv1 = Triangle.getInterpolation( _localPoint, tri.a, tri.b, tri.c, _uvA, _uvB, _uvC, hit.uv1 );
+					if ( ! IS_GT_REVISION_169 ) hit.uv1 = resUv1;
+					if ( IS_LT_REVISION_161 ) hit.uv2 = hit.uv1;
+
+				}
+
+				if ( normal ) {
+
+					_normalA.fromBufferAttribute( normal, ai );
+					_normalB.fromBufferAttribute( normal, bi );
+					_normalC.fromBufferAttribute( normal, ci );
+
+					hit.normal = new Vector3();
+					const resNormal = Triangle.getInterpolation( _localPoint, tri.a, tri.b, tri.c, _normalA, _normalB, _normalC, hit.normal );
+					if ( hit.normal.dot( _ray.direction ) > 0 ) {
+
+						hit.normal.multiplyScalar( - 1 );
+
+					}
+
+					if ( ! IS_GT_REVISION_169 ) hit.normal = resNormal;
+
+				}
+
+				// first hit only settings
+				closestDistance = hit.distance;
+				closestHit = hit;
+
+				if ( ! firstHitOnly ) {
+
+					intersects.push( hit );
+
+				}
+
+			}
+
+		};
 
 		this.shapecast( {
 			boundsTraverseOrder: box => {
@@ -210,142 +355,27 @@ export class SkinnedMeshBVH extends GeometryBVH {
 			},
 			intersectsTriangle: ( tri, triIndex ) => {
 
-				// get the intersection
-				let point = null;
-				if ( material.side === FrontSide ) {
+				if ( Array.isArray( material ) ) {
 
-					point = _ray.intersectTriangle( tri.a, tri.b, tri.c, true, _localPoint );
+					// check which groups the triangle is present in and run the
+					// intersection once per matching group with the group material,
+					// matching the behavior of the native Mesh raycast
+					const { groups } = geometry;
+					const firstIndex = this.resolvePrimitiveIndex( triIndex ) * 3;
+					for ( let i = 0, l = groups.length; i < l; i ++ ) {
 
-				} else if ( material.side === BackSide ) {
+						const { start, count, materialIndex } = groups[ i ];
+						if ( firstIndex >= start && firstIndex < start + count ) {
 
-					point = _ray.intersectTriangle( tri.c, tri.b, tri.a, true, _localPoint );
-
-				} else {
-
-					point = _ray.intersectTriangle( tri.a, tri.b, tri.c, false, _localPoint );
-
-				}
-
-				if ( ! point ) {
-
-					return;
-
-				}
-
-				// transform it into world space
-				point = point.clone().applyMatrix4( matrixWorld );
-
-				// check distance to ray
-				const dist = raycaster.ray.origin.distanceTo( point );
-				if ( dist >= raycaster.near && dist <= raycaster.far ) {
-
-					if ( firstHitOnly && dist >= closestDistance ) {
-
-						return;
-
-					}
-
-					// get the vertex indices
-					const { geometry } = this;
-					const { index } = geometry;
-					const actualTri = this.resolvePrimitiveIndex( triIndex );
-					const triOffset = actualTri * 3;
-
-					let ai = triOffset + 0;
-					let bi = triOffset + 1;
-					let ci = triOffset + 2;
-
-					if ( index ) {
-
-						ai = index.array[ ai ];
-						bi = index.array[ bi ];
-						ci = index.array[ ci ];
-
-					}
-
-					// build the intersection result
-					const hit = {
-						distance: dist,
-						point: point.clone(),
-						object,
-						uv: null,
-						uv1: null,
-						normal: null,
-						face: {
-							a: ai,
-							b: bi,
-							c: ci,
-							normal: Triangle.getNormal( tri.a, tri.b, tri.c, new Vector3() ),
-							materialIndex: 0
-						},
-						faceIndex: actualTri,
-					};
-
-					if ( IS_GT_REVISION_169 ) {
-
-						const barycoord = new Vector3();
-						Triangle.getBarycoord( _localPoint, tri.a, tri.b, tri.c, barycoord );
-						hit.barycoord = barycoord;
-
-					}
-
-					// add attribute fields if available
-					const uv = geometry.attributes.uv;
-					const uv1 = geometry.attributes.uv1;
-					const normal = geometry.attributes.normal;
-
-					if ( uv ) {
-
-						_uvA.fromBufferAttribute( uv, ai );
-						_uvB.fromBufferAttribute( uv, bi );
-						_uvC.fromBufferAttribute( uv, ci );
-
-						hit.uv = new Vector2();
-						const resUv = Triangle.getInterpolation( _localPoint, tri.a, tri.b, tri.c, _uvA, _uvB, _uvC, hit.uv );
-						if ( ! IS_GT_REVISION_169 ) hit.uv = resUv;
-
-					}
-
-					if ( uv1 ) {
-
-						_uvA.fromBufferAttribute( uv1, ai );
-						_uvB.fromBufferAttribute( uv1, bi );
-						_uvC.fromBufferAttribute( uv1, ci );
-
-						hit.uv1 = new Vector2();
-						const resUv1 = Triangle.getInterpolation( _localPoint, tri.a, tri.b, tri.c, _uvA, _uvB, _uvC, hit.uv1 );
-						if ( ! IS_GT_REVISION_169 ) hit.uv1 = resUv1;
-						if ( IS_LT_REVISION_161 ) hit.uv2 = hit.uv1;
-
-					}
-
-					if ( normal ) {
-
-						_normalA.fromBufferAttribute( normal, ai );
-						_normalB.fromBufferAttribute( normal, bi );
-						_normalC.fromBufferAttribute( normal, ci );
-
-						hit.normal = new Vector3();
-						const resNormal = Triangle.getInterpolation( _localPoint, tri.a, tri.b, tri.c, _normalA, _normalB, _normalC, hit.normal );
-						if ( hit.normal.dot( _ray.direction ) > 0 ) {
-
-							hit.normal.multiplyScalar( - 1 );
+							checkTriangle( tri, triIndex, material[ materialIndex ].side, materialIndex );
 
 						}
 
-						if ( ! IS_GT_REVISION_169 ) hit.normal = resNormal;
-
 					}
 
-					// first hit only settings
-					closestDistance = hit.distance;
-					closestHit = hit;
+				} else {
 
-					if ( ! firstHitOnly ) {
-
-						intersects.push( hit );
-
-					}
+					checkTriangle( tri, triIndex, material.side, 0 );
 
 				}
 
