@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - ParallelMeshBVHWorker: A build that throws now rejects instead of never settling and blocking later builds.
 - Workers: A failed build no longer also logs an unhandled promise rejection when the caller handles it.
 - BVHComputeData: "update" now throws when the BVH is deeper than the traversal stack.
+- StaticGeometryGenerator: Changing only the morph target influences now re-bakes the affected mesh's positions, normals and tangents even when the skeleton and world matrix are unchanged.
+- StaticGeometryGenerator: Mirrored meshes no longer have their triangle winding order flipped when "applyWorldTransforms" is false since the baked vertices are in local space.
+- StaticGeometryGenerator: The index buffer is now rewritten when a mesh's index or mirrored state changes, so enabling "applyWorldTransforms" or mirroring a mesh updates the merged index in place.
+- StaticGeometryGenerator: Tangents baked from mirrored meshes with world transforms applied now have their bitangent sign flipped to match the rendered tangent frame.
+- StaticGeometryGenerator: Meshes whose geometry, index or skeleton have not changed are still skipped, and generating into a new target geometry bakes every mesh again.
 
 ## [0.9.18] - 2026-11-03
 ### Added

@@ -260,13 +260,15 @@ function mergeBufferGeometries( geometries, options = { useGroups: false, update
 
 					for ( let j = 0; j < index.count; ++ j ) {
 
-						targetIndex.setX( targetOffset, index.getX( j ) + indexOffset );
-						targetOffset ++;
+						targetIndex.setX( targetOffset + j, index.getX( j ) + indexOffset );
 
 					}
 
 				}
 
+				// advance the offsets for every geometry, including skipped ones, so the data
+				// for subsequent geometries is written at the correct location
+				targetOffset += index.count;
 				indexOffset += geometry.attributes.position.count;
 
 			}
@@ -313,7 +315,8 @@ function mergeBufferGeometries( geometries, options = { useGroups: false, update
 
 }
 
-function checkTypedArrayEquality( a, b ) {
+// Compares two arrays or typed arrays, treating null and null as equal
+function checkArrayEquality( a, b ) {
 
 	if ( a === null || b === null ) {
 
@@ -383,15 +386,94 @@ function invertGeometry( geometry ) {
 
 }
 
+// Returns the number of primitives to bake for the geometry
+function getPrimitiveCount( geometry ) {
+
+	return ( geometry.index ? geometry.index.count : geometry.attributes.position.count ) / 3;
+
+}
+
+// Returns the version of the attribute data, accounting for interleaved attributes
+function getAttributeVersion( attr ) {
+
+	return attr.isInterleavedBufferAttribute ? attr.data.version : attr.version;
+
+}
+
+// Fills "target" with the attributes and versions baked from the geometry. Morph target
+// attributes are included since they are baked into the output as well. The attribute references
+// are stored alongside the versions so attribute replacement is detected even if the new
+// attribute happens to have the same version number.
+function getAttributeState( geometry, target ) {
+
+	target.length = 0;
+
+	const addAttribute = attr => {
+
+		if ( attr ) {
+
+			target.push( attr, getAttributeVersion( attr ) );
+
+		}
+
+	};
+
+	addAttribute( geometry.index );
+
+	const attributes = geometry.attributes;
+	for ( const key in attributes ) {
+
+		addAttribute( attributes[ key ] );
+
+	}
+
+	const morphAttributes = geometry.morphAttributes;
+	for ( const key in morphAttributes ) {
+
+		const attrList = morphAttributes[ key ];
+		for ( let i = 0, l = attrList.length; i < l; i ++ ) {
+
+			addAttribute( attrList[ i ] );
+
+		}
+
+	}
+
+	return target;
+
+}
+
+// Ensures the skeleton's flattened bone matrices reflect the current bone transforms
+function updateSkeleton( skeleton ) {
+
+	// ensure the bone matrix array is updated to the appropriate length
+	if ( ! skeleton.boneTexture ) {
+
+		skeleton.computeBoneTexture();
+
+	}
+
+	skeleton.update();
+
+}
+
+// scratch array reused when comparing the baked attribute state to avoid per-frame allocations
+const _attributeStateScratch = [];
+
 // Checks whether the geometry changed between this and last evaluation
 class GeometryDiff {
 
 	constructor( mesh ) {
 
 		this.matrixWorld = new Matrix4();
-		this.geometryHash = null;
+		this.geometry = null;
+		this.attributeState = null;
+		this.morphTargetsRelative = false;
+		this.morphTargetInfluences = null;
+		this.skeleton = null;
 		this.boneMatrices = null;
 		this.primitiveCount = - 1;
+		this.vertexCount = - 1;
 		this.mesh = mesh;
 
 		this.update();
@@ -403,21 +485,22 @@ class GeometryDiff {
 		const mesh = this.mesh;
 		const geometry = mesh.geometry;
 		const skeleton = mesh.skeleton;
-		const primitiveCount = ( geometry.index ? geometry.index.count : geometry.attributes.position.count ) / 3;
+		const morphTargetInfluences = mesh.morphTargetInfluences;
+		const primitiveCount = getPrimitiveCount( geometry );
 		this.matrixWorld.copy( mesh.matrixWorld );
-		this.geometryHash = geometry.attributes.position.version;
+		this.geometry = geometry;
+		this.attributeState = getAttributeState( geometry, [] );
+		this.morphTargetsRelative = geometry.morphTargetsRelative;
 		this.primitiveCount = primitiveCount;
+		this.vertexCount = geometry.attributes.position.count;
+
+		// store a copy of the morph target weights so changes to them are detected even if the
+		// skeleton and world matrix remain the same
+		this.morphTargetInfluences = morphTargetInfluences ? morphTargetInfluences.slice() : null;
 
 		if ( skeleton ) {
 
-			// ensure the bone matrix array is updated to the appropriate length
-			if ( ! skeleton.boneTexture ) {
-
-				skeleton.computeBoneTexture();
-
-			}
-
-			skeleton.update();
+			updateSkeleton( skeleton );
 
 			// copy data if possible otherwise clone it
 			const boneMatrices = skeleton.boneMatrices;
@@ -437,18 +520,59 @@ class GeometryDiff {
 
 		}
 
+		this.skeleton = skeleton;
+
+	}
+
+	// returns whether the attribute references and versions of the geometry match the stored ones
+	hasSameAttributes( geometry ) {
+
+		const state = getAttributeState( geometry, _attributeStateScratch );
+		const previous = this.attributeState;
+		if ( ! previous || previous.length !== state.length ) {
+
+			return false;
+
+		}
+
+		for ( let i = 0, l = state.length; i < l; i ++ ) {
+
+			if ( state[ i ] !== previous[ i ] ) {
+
+				return false;
+
+			}
+
+		}
+
+		return true;
+
 	}
 
 	didChange() {
 
 		const mesh = this.mesh;
 		const geometry = mesh.geometry;
-		const primitiveCount = ( geometry.index ? geometry.index.count : geometry.attributes.position.count ) / 3;
+		const skeleton = mesh.skeleton;
+
+		// the bone matrices are only updated when the skeleton is rendered so ensure they reflect
+		// the current pose before comparing them
+		if ( skeleton ) {
+
+			updateSkeleton( skeleton );
+
+		}
+
 		const identical =
+			this.geometry === geometry &&
 			this.matrixWorld.equals( mesh.matrixWorld ) &&
-			this.geometryHash === geometry.attributes.position.version &&
-			checkTypedArrayEquality( mesh.skeleton && mesh.skeleton.boneMatrices || null, this.boneMatrices ) &&
-			this.primitiveCount === primitiveCount;
+			this.hasSameAttributes( geometry ) &&
+			geometry.morphTargetsRelative === this.morphTargetsRelative &&
+			checkArrayEquality( mesh.morphTargetInfluences || null, this.morphTargetInfluences ) &&
+			this.skeleton === skeleton &&
+			checkArrayEquality( skeleton && skeleton.boneMatrices || null, this.boneMatrices ) &&
+			getPrimitiveCount( geometry ) === this.primitiveCount &&
+			geometry.attributes.position.count === this.vertexCount;
 
 		return ! identical;
 
@@ -515,6 +639,11 @@ export class StaticGeometryGenerator {
 		this._intermediateGeometry = new Array( finalMeshes.length ).fill().map( () => new BufferGeometry() );
 		this._diffMap = new WeakMap();
 
+		// the "applyWorldTransforms" value and per-mesh index winding state that the generated
+		// geometry currently reflects so changes to either can be detected
+		this._lastApplyWorldTransforms = null;
+		this._indexState = null;
+
 	}
 
 	/**
@@ -550,24 +679,88 @@ export class StaticGeometryGenerator {
 	 * will be thrown if the attributes or geometry on the meshes to bake has been changed and
 	 * are incompatible lengths, types, etc.
 	 *
-	 * On subsequent calls the "index" buffer will not be modified so any BVH generated for the
-	 * geometry is unaffected. Once the geometry is updated the `MeshBVH.refit` function can be
-	 * called to update the BVH.
+	 * On subsequent calls the "index" buffer will not be modified unless the geometry's index or
+	 * a mesh's mirrored state changed, so any BVH generated for the geometry is unaffected. Once
+	 * the geometry is updated the `MeshBVH.refit` function can be called to update the BVH.
 	 *
 	 * @param {BufferGeometry} [targetGeometry]
 	 * @returns {BufferGeometry}
 	 */
 	generate( targetGeometry = new BufferGeometry() ) {
 
+		const { meshes, useGroups, applyWorldTransforms, _intermediateGeometry, _diffMap } = this;
+
+		// if the "applyWorldTransforms" setting has changed then every mesh needs to be re-baked
+		// and the merged index buffer rewritten since the baked winding order may have changed
+		const transformStateChanged = this._lastApplyWorldTransforms !== null && this._lastApplyWorldTransforms !== applyWorldTransforms;
+		if ( transformStateChanged ) {
+
+			for ( let i = 0, l = meshes.length; i < l; i ++ ) {
+
+				_diffMap.delete( meshes[ i ] );
+
+			}
+
+		}
+
+		// only skip meshes if the target geometry already contains the previously baked data -
+		// otherwise there is nothing to skip and every mesh has to be copied over. The per-mesh
+		// vertex counts also have to match so the merged attribute and index offsets are unchanged.
+		const prevIndexState = this._indexState;
+		let vertexCount = 0;
+		let sameVertexCounts = !! prevIndexState && prevIndexState.length === meshes.length;
+		for ( let i = 0, l = meshes.length; i < l; i ++ ) {
+
+			const count = meshes[ i ].geometry.attributes.position.count;
+			vertexCount += count;
+
+			if ( ! prevIndexState || ! prevIndexState[ i ] || prevIndexState[ i ].vertexCount !== count ) {
+
+				sameVertexCounts = false;
+
+			}
+
+		}
+
+		const targetPosition = targetGeometry.attributes.position;
+		const isReusableTarget = sameVertexCounts && !! targetPosition && targetPosition.count === vertexCount;
+
 		// track which attributes have been updated and which to skip to avoid unnecessary attribute copies
 		let skipAttributes = [];
-		const { meshes, useGroups, _intermediateGeometry, _diffMap } = this;
+		const indexState = new Array( meshes.length );
+		let updateIndex = transformStateChanged || ! isReusableTarget;
 		for ( let i = 0, l = meshes.length; i < l; i ++ ) {
 
 			const mesh = meshes[ i ];
+			const geometry = mesh.geometry;
+			const index = geometry.index;
+			const inverted = applyWorldTransforms && mesh.matrixWorld.determinant() < 0;
+			indexState[ i ] = {
+				index,
+				version: index ? getAttributeVersion( index ) : - 1,
+				count: index ? index.count : - 1,
+				vertexCount: geometry.attributes.position.count,
+				inverted,
+			};
+
+			// the merged index only needs to be rewritten if a mesh's index or winding order changed
+			const previousState = this._indexState && this._indexState[ i ];
+			if (
+				! previousState ||
+				previousState.index !== indexState[ i ].index ||
+				previousState.version !== indexState[ i ].version ||
+				previousState.count !== indexState[ i ].count ||
+				previousState.vertexCount !== indexState[ i ].vertexCount ||
+				previousState.inverted !== inverted
+			) {
+
+				updateIndex = true;
+
+			}
+
 			const geom = _intermediateGeometry[ i ];
 			const diff = _diffMap.get( mesh );
-			if ( ! diff || diff.didChange( mesh ) ) {
+			if ( ! isReusableTarget || ! diff || diff.didChange() ) {
 
 				this._convertToStaticGeometry( mesh, geom );
 				skipAttributes.push( false );
@@ -612,9 +805,12 @@ export class StaticGeometryGenerator {
 
 		} else {
 
-			mergeBufferGeometries( _intermediateGeometry, { useGroups, skipAttributes }, targetGeometry );
+			mergeBufferGeometries( _intermediateGeometry, { useGroups, updateIndex, skipAttributes }, targetGeometry );
 
 		}
+
+		this._lastApplyWorldTransforms = applyWorldTransforms;
+		this._indexState = indexState;
 
 		for ( const key in targetGeometry.attributes ) {
 
@@ -687,6 +883,11 @@ export class StaticGeometryGenerator {
 		const morphInfluences = mesh.morphTargetInfluences;
 		const normalMatrix = new Matrix3();
 		normalMatrix.getNormalMatrix( mesh.matrixWorld );
+
+		// a negative determinant world transform mirrors the geometry so the winding order and
+		// the tangent frame handedness need to be adjusted to match the rendered appearance
+		const mirrored = mesh.matrixWorld.determinant() < 0;
+		const tangentMirrored = applyWorldTransforms && mirrored;
 
 		// copy the index
 		if ( geometry.index ) {
@@ -782,7 +983,10 @@ export class StaticGeometryGenerator {
 
 				}
 
-				targetAttributes.tangent.setXYZW( i, _tangentVector.x, _tangentVector.y, _tangentVector.z, _tangentVector4.w );
+				// a mirrored transform flips the tangent frame handedness so flip the bitangent sign
+				// to keep the baked normal / tangent / bitangent frame consistent with the rendered one
+				const tangentW = tangentMirrored ? - _tangentVector4.w : _tangentVector4.w;
+				targetAttributes.tangent.setXYZW( i, _tangentVector.x, _tangentVector.y, _tangentVector.z, tangentW );
 
 			}
 
@@ -809,7 +1013,9 @@ export class StaticGeometryGenerator {
 
 		}
 
-		if ( mesh.matrixWorld.determinant() < 0 ) {
+		// flipping the winding order only makes sense if the vertices were actually mirrored by
+		// the world transform - otherwise the baked geometry is in local space and unchanged
+		if ( applyWorldTransforms && mesh.matrixWorld.determinant() < 0 ) {
 
 			invertGeometry( targetGeometry );
 
