@@ -4,6 +4,7 @@ import { Matrix4, Line3, Vector3, Ray, Box3, REVISION } from 'three';
 import { PrimitivePool } from '../utils/PrimitivePool.js';
 import { INTERSECTED, NOT_INTERSECTED } from './Constants.js';
 import { GeometryBVH } from './GeometryBVH.js';
+import { getVertexCount } from './build/geometryUtils.js';
 
 // three.js r188 scales the raycast threshold by the largest world scale (mrdoob/three.js#35466)
 const IS_GT_REVISION_188 = parseInt( REVISION ) >= 188;
@@ -39,6 +40,92 @@ export class LineSegmentsBVH extends GeometryBVH {
 
 	}
 
+	constructor( geometry, options = {} ) {
+
+		// Native raycasting pairs vertices starting at the draw range start, so an
+		// odd start shifts the segments off the index buffer's natural vertex
+		// pairs. The non-indirect build can only reorder whole vertex pairs in
+		// the index buffer so fall back to indirect mode to keep the segment
+		// topology consistent with native raycasting.
+		const drawRange = options.range || geometry.drawRange;
+		if ( ! options.indirect && Math.max( 0, drawRange.start ) % 2 !== 0 ) {
+
+			options = {
+				...options,
+				indirect: true,
+			};
+
+		}
+
+		super( geometry, options );
+
+	}
+
+	init( options ) {
+
+		// store the segment lattice shift so primitives map to the same vertices
+		// that native raycasting uses
+		const drawRange = options.range || this.geometry.drawRange;
+		this._vertexOffset = this.getVertexOffset( drawRange );
+
+		super.init( options );
+
+	}
+
+	/**
+	 * Returns the shift of the segment lattice relative to the natural vertex
+	 * pairs in the index buffer imposed by the draw range. "LineSegments"
+	 * primitives pair vertices starting at the draw range start, so an odd
+	 * start shifts the lattice by one.
+	 * @param {Object} drawRange
+	 * @returns {number}
+	 */
+	getVertexOffset( drawRange ) {
+
+		return Math.max( 0, drawRange.start ) % 2;
+
+	}
+
+	getIndirectRanges( range ) {
+
+		const vertexOffset = this._vertexOffset || 0;
+		if ( vertexOffset === 0 ) {
+
+			return super.getIndirectRanges( range );
+
+		}
+
+		// With a shifted segment lattice the primitives no longer align with the
+		// group boundaries, and native raycasting ignores groups anyway, so
+		// generate the segments from the draw range alone.
+		const { geometry, primitiveStride } = this;
+		const drawRange = range || geometry.drawRange;
+		const vertCount = getVertexCount( geometry );
+		const start = Math.max( 0, drawRange.start );
+		const end = Math.min( vertCount, drawRange.start + drawRange.count );
+
+		return [ {
+			offset: ( start - vertexOffset ) / primitiveStride,
+			count: Math.floor( ( end - start ) / primitiveStride ),
+		} ];
+
+	}
+
+	/**
+	 * Returns the index of the vertex that follows `i0` in the line topology,
+	 * before the index buffer is resolved. Open topologies simply connect each
+	 * vertex to the next one in the buffer. Closed topologies (see
+	 * {@link LineLoopBVH}) wrap the last vertex in the draw range back to the
+	 * start of the range.
+	 * @param {number} i0 - The vertex position of the segment start.
+	 * @returns {number} The vertex position of the segment end.
+	 */
+	getNextVertexIndex( i0 ) {
+
+		return i0 + 1;
+
+	}
+
 	writePrimitiveBounds( i, targetBuffer, baseIndex ) {
 
 		const indirectBuffer = this._indirectBuffer;
@@ -47,12 +134,9 @@ export class LineSegmentsBVH extends GeometryBVH {
 		const posAttr = geometry.attributes.position;
 		const indexAttr = geometry.index;
 
-		// TODO: this may not be right for a LineLoop with a limited draw range / groups
-		const vertCount = indexAttr ? indexAttr.count : posAttr.count;
-
 		const prim = indirectBuffer ? indirectBuffer[ i ] : i;
-		let i0 = prim * primitiveStride;
-		let i1 = ( i0 + 1 ) % vertCount;
+		let i0 = prim * primitiveStride + this._vertexOffset;
+		let i1 = this.getNextVertexIndex( i0 );
 		if ( indexAttr ) {
 
 			i0 = indexAttr.getX( i0 );
@@ -180,7 +264,7 @@ export class LineSegmentsBVH extends GeometryBVH {
 				closestHit = {
 					distance,
 					point: _intersectPointOnSegment.clone().applyMatrix4( matrixWorld ),
-					index: index * this.primitiveStride,
+					index: index * this.primitiveStride + this._vertexOffset,
 					face: null,
 					faceIndex: null,
 					barycoord: null,
@@ -236,6 +320,43 @@ export class LineLoopBVH extends LineSegmentsBVH {
 
 	}
 
+	// The loop topology is defined in vertex units so no segment lattice shift
+	// applies.
+	getVertexOffset() {
+
+		return 0;
+
+	}
+
+	// Native line raycasting ignores material groups and only respects the draw
+	// range, so the indirect buffer spans the whole draw range rather than the
+	// group-aligned ranges.
+	getIndirectRanges( range ) {
+
+		const { geometry } = this;
+		const drawRange = range || geometry.drawRange;
+		const vertCount = getVertexCount( geometry );
+		const start = Math.max( 0, drawRange.start );
+		const end = Math.min( vertCount, drawRange.start + drawRange.count );
+
+		// Store the vertex range so the closing segment of the loop can connect
+		// the last vertex in the range back to the first one.
+		this._drawRangeStart = start;
+		this._drawRangeEnd = end;
+
+		return [ { offset: start, count: end - start } ];
+
+	}
+
+	// The last vertex in the draw range connects back to the first vertex in
+	// the range to close the loop, matching native "LineLoop" raycasting.
+	getNextVertexIndex( i0 ) {
+
+		const next = i0 + 1;
+		return next >= this._drawRangeEnd ? this._drawRangeStart : next;
+
+	}
+
 }
 
 /**
@@ -247,10 +368,18 @@ export class LineLoopBVH extends LineSegmentsBVH {
  */
 export class LineBVH extends LineLoopBVH {
 
+	// The open line connects each vertex to the next one without ever wrapping
+	// back to the start of the draw range.
+	getNextVertexIndex( i0 ) {
+
+		return i0 + 1;
+
+	}
+
 	getRootRanges( ...args ) {
 
 		const res = super.getRootRanges( ...args );
-		res.forEach( group => group.count -- );
+		res.forEach( group => group.count = Math.max( 0, group.count - 1 ) );
 		return res;
 
 	}
@@ -270,13 +399,12 @@ function iterateOverLines(
 	const { geometry, primitiveStride } = bvh;
 	const { index } = geometry;
 	const posAttr = geometry.attributes.position;
-	const vertCount = index ? index.count : posAttr.count;
 
 	for ( let i = offset, l = count + offset; i < l; i ++ ) {
 
 		const prim = bvh.resolvePrimitiveIndex( i );
-		let i0 = prim * primitiveStride;
-		let i1 = ( i0 + 1 ) % vertCount;
+		let i0 = prim * primitiveStride + bvh._vertexOffset;
+		let i1 = bvh.getNextVertexIndex( i0 );
 		if ( index ) {
 
 			i0 = index.getX( i0 );

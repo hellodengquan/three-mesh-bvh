@@ -155,12 +155,12 @@ export class GeometryBVH extends BVH {
 
 	init( options ) {
 
-		const { geometry, primitiveStride } = this;
+		const { geometry } = this;
 
 		if ( options.indirect ) {
 
 			// construct an buffer that is indirectly sorts the triangles used for the BVH
-			const ranges = getRootPrimitiveRanges( geometry, options.range, primitiveStride );
+			const ranges = this.getIndirectRanges( options.range );
 			const indirectBuffer = generateIndirectBuffer( ranges, options.useSharedArrayBuffer );
 			this._indirectBuffer = indirectBuffer;
 
@@ -177,6 +177,15 @@ export class GeometryBVH extends BVH {
 			geometry.boundingBox = this.getBoundingBox( new Box3() );
 
 		}
+
+	}
+
+	// Returns the set of primitive ranges used to generate the indirect buffer
+	// when building in indirect mode. Defaults to the ranges defined by the
+	// geometry draw range and material groups.
+	getIndirectRanges( range ) {
+
+		return getRootPrimitiveRanges( this.geometry, range, this.primitiveStride );
 
 	}
 
