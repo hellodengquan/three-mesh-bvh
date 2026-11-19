@@ -837,6 +837,20 @@ getInstanceFromId( compositeId: number ): number
 Returns the instance index associated with a composite id as provided to `intersectsObject`.
 
 
+### .update
+
+```js
+update(): void
+```
+
+Updates the BVH to reflect the current state of the tracked objects. If the
+primitive set has changed ( eg `InstancedMesh.count` was modified or instances
+were added to / removed from a `BatchedMesh` ) the tree is rebuilt with the new
+set of primitives. Otherwise the existing tree is simply refit to account for
+any transform changes, which is significantly cheaper than a full rebuild. The
+resulting hit set is guaranteed to match that of a full rebuild.
+
+
 ### .shapecast
 
 ```js

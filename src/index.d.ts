@@ -255,6 +255,7 @@ export class ObjectBVH extends BVH {
 	constructor( root: Array<Object3D> | Object3D, options?: BVHOptions );
 	getObjectFromId( compositeId: number ): Object3D;
 	getInstanceFromId( compositeId: number ): number;
+	update(): void;
 	shapecast(
 		callbacks: ShapecastCallbacks & {
 			intersectsObject?: (

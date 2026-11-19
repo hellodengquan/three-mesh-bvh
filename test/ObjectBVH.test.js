@@ -154,6 +154,253 @@ function runSuiteWithOptions( options ) {
 
 }
 
+describe( 'ObjectBVH.update', () => {
+
+	let scene, objects, instancedMesh, batchedMesh, batchedInstanceIds, raycaster;
+
+	beforeEach( () => {
+
+		setSeed( 123456789 );
+
+		scene = new Scene();
+		objects = [];
+
+		// Regular meshes
+		for ( let i = 0; i < 5; i ++ ) {
+
+			const mesh = new Mesh( new BoxGeometry( 0.6, 0.6, 0.6 ), new MeshBasicMaterial() );
+			randomizeObjectTransform( mesh );
+			scene.add( mesh );
+			objects.push( mesh );
+
+		}
+
+		// InstancedMesh — 20 instances
+		instancedMesh = new InstancedMesh( new BoxGeometry( 0.7, 0.7, 0.7 ), new MeshBasicMaterial(), 20 );
+		for ( let i = 0; i < 20; i ++ ) {
+
+			randomizeMatrix( _matrix );
+			instancedMesh.setMatrixAt( i, _matrix );
+
+		}
+
+		instancedMesh.instanceMatrix.needsUpdate = true;
+		scene.add( instancedMesh );
+		objects.push( instancedMesh );
+
+		// BatchedMesh — 2 geometry types, 20 instances total
+		batchedMesh = new BatchedMesh( 20, 2000, 2000, new MeshBasicMaterial() );
+		const sphereGeomId = batchedMesh.addGeometry( new SphereGeometry( 0.4, 6, 6 ) );
+		const boxGeomId = batchedMesh.addGeometry( new BoxGeometry( 0.6, 0.6, 0.6 ) );
+		batchedMesh.userData.sphereGeomId = sphereGeomId;
+		batchedMesh.userData.boxGeomId = boxGeomId;
+
+		batchedInstanceIds = [];
+		for ( let i = 0; i < 10; i ++ ) {
+
+			randomizeMatrix( _matrix );
+			batchedInstanceIds.push( batchedMesh.addInstance( sphereGeomId ) );
+			batchedMesh.setMatrixAt( batchedInstanceIds[ batchedInstanceIds.length - 1 ], _matrix );
+
+			randomizeMatrix( _matrix );
+			batchedInstanceIds.push( batchedMesh.addInstance( boxGeomId ) );
+			batchedMesh.setMatrixAt( batchedInstanceIds[ batchedInstanceIds.length - 1 ], _matrix );
+
+		}
+
+		scene.add( batchedMesh );
+		objects.push( batchedMesh );
+
+		scene.updateMatrixWorld( true );
+
+		raycaster = new Raycaster();
+
+	} );
+
+	function createBVH() {
+
+		return new ObjectBVH( scene, {
+			matrixWorld: scene.matrixWorld,
+			targetLeafSize: 1,
+		} );
+
+	}
+
+	// casts a deterministic set of rays and verifies that the bvh hit set matches
+	// both the native Raycaster results and a full rebuild of the BVH
+	function expectConsistentHits( bvh ) {
+
+		expect( validateBounds( bvh ) ).toBeTruthy();
+
+		setSeed( 987654321 );
+		for ( let i = 0; i < 25; i ++ ) {
+
+			random();
+
+			raycaster.ray.origin.randomDirection().multiplyScalar( 10 );
+			raycaster.ray.direction.copy( raycaster.ray.origin ).multiplyScalar( - 1 ).normalize();
+
+			raycaster.firstHitOnly = false;
+			const bvhHits = bvh.raycast( raycaster, [] );
+			bvhHits.sort( ( a, b ) => a.distance - b.distance );
+
+			raycaster.firstHitOnly = true;
+			const firstHit = bvh.raycast( raycaster, [] );
+
+			raycaster.firstHitOnly = false;
+			const rebuiltHits = createBVH().raycast( raycaster, [] );
+			rebuiltHits.sort( ( a, b ) => a.distance - b.distance );
+
+			const nativeHits = raycaster.intersectObjects( objects, false );
+
+			expect( bvhHits ).toEqual( nativeHits );
+			expect( bvhHits ).toEqual( rebuiltHits );
+			expect( nativeHits[ 0 ] ).toEqual( firstHit[ 0 ] );
+
+		}
+
+	}
+
+	it( 'should only hit current instances after the InstancedMesh count is reduced.', () => {
+
+		const bvh = createBVH();
+		instancedMesh.count = 7;
+		bvh.update();
+
+		expectConsistentHits( bvh );
+
+	} );
+
+	it( 'should hit restored instances after the InstancedMesh count is restored.', () => {
+
+		const bvh = createBVH();
+
+		instancedMesh.count = 3;
+		bvh.update();
+		expectConsistentHits( bvh );
+
+		instancedMesh.count = 20;
+		bvh.update();
+		expectConsistentHits( bvh );
+
+	} );
+
+	it( 'should reflect added and removed BatchedMesh instances.', () => {
+
+		const bvh = createBVH();
+
+		// remove half of the instances
+		for ( let i = 0; i < 10; i ++ ) {
+
+			batchedMesh.deleteInstance( batchedInstanceIds[ i * 2 ] );
+
+		}
+
+		bvh.update();
+		expectConsistentHits( bvh );
+
+		// add new instances back in
+		for ( let i = 0; i < 5; i ++ ) {
+
+			randomizeMatrix( _matrix );
+			const id = batchedMesh.addInstance( batchedMesh.userData.sphereGeomId );
+			batchedMesh.setMatrixAt( id, _matrix );
+
+		}
+
+		bvh.update();
+		expectConsistentHits( bvh );
+
+	} );
+
+	it( 'should match a full rebuild after instance matrices change.', () => {
+
+		const bvh = createBVH();
+
+		// modify the instance matrices without changing the instance count
+		for ( let i = 0; i < 20; i ++ ) {
+
+			randomizeMatrix( _matrix );
+			instancedMesh.setMatrixAt( i, _matrix );
+
+		}
+
+		instancedMesh.instanceMatrix.needsUpdate = true;
+
+		for ( let i = 0; i < batchedInstanceIds.length; i ++ ) {
+
+			randomizeMatrix( _matrix );
+			batchedMesh.setMatrixAt( batchedInstanceIds[ i ], _matrix );
+
+		}
+
+		bvh.update();
+		expectConsistentHits( bvh );
+
+	} );
+
+	it( 'should not hit objects filtered out by the raycaster layers.', () => {
+
+		const bvh = createBVH();
+
+		// move objects to layers the raycaster is not testing
+		objects[ 0 ].layers.set( 1 );
+		instancedMesh.layers.set( 2 );
+		batchedMesh.layers.set( 3 );
+
+		setSeed( 987654321 );
+		for ( let i = 0; i < 25; i ++ ) {
+
+			random();
+
+			raycaster.ray.origin.randomDirection().multiplyScalar( 10 );
+			raycaster.ray.direction.copy( raycaster.ray.origin ).multiplyScalar( - 1 ).normalize();
+
+			raycaster.firstHitOnly = false;
+			const bvhHits = bvh.raycast( raycaster, [] );
+			bvhHits.sort( ( a, b ) => a.distance - b.distance );
+
+			const nativeHits = raycaster.intersectObjects( objects, false );
+
+			expect( bvhHits ).toEqual( nativeHits );
+			expect( bvhHits.every( hit => hit.object !== objects[ 0 ] ) ).toBe( true );
+			expect( bvhHits.every( hit => hit.object !== instancedMesh ) ).toBe( true );
+			expect( bvhHits.every( hit => hit.object !== batchedMesh ) ).toBe( true );
+
+		}
+
+		// enabling the layers should yield hits again
+		raycaster.layers.enableAll();
+		setSeed( 987654321 );
+
+		let foundInstanced = false;
+		let foundBatched = false;
+		for ( let i = 0; i < 25; i ++ ) {
+
+			random();
+
+			raycaster.ray.origin.randomDirection().multiplyScalar( 10 );
+			raycaster.ray.direction.copy( raycaster.ray.origin ).multiplyScalar( - 1 ).normalize();
+
+			raycaster.firstHitOnly = false;
+			const bvhHits = bvh.raycast( raycaster, [] );
+			bvhHits.sort( ( a, b ) => a.distance - b.distance );
+
+			const nativeHits = raycaster.intersectObjects( objects, false );
+			expect( bvhHits ).toEqual( nativeHits );
+
+			foundInstanced = foundInstanced || bvhHits.some( hit => hit.object === instancedMesh );
+			foundBatched = foundBatched || bvhHits.some( hit => hit.object === batchedMesh );
+
+		}
+
+		expect( foundInstanced ).toBe( true );
+		expect( foundBatched ).toBe( true );
+
+	} );
+
+} );
+
 function randomizeMatrix( target ) {
 
 	_position.set(

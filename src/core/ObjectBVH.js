@@ -68,6 +68,7 @@ export class ObjectBVH extends BVH {
 		this.precise = options.precise;
 		this.includeInstances = options.includeInstances;
 		this.matrixWorld = options.matrixWorld;
+		this._options = options;
 
 		this.init( options );
 
@@ -109,6 +110,48 @@ export class ObjectBVH extends BVH {
 		this._fillPrimitiveBuffer( objects, idBits, this.primitiveBuffer );
 
 		super.init( options );
+
+	}
+
+	/**
+	 * Updates the BVH to reflect the current state of the tracked objects. If the
+	 * primitive set has changed ( eg `InstancedMesh.count` was modified or instances
+	 * were added to / removed from a `BatchedMesh` ) the tree is rebuilt with the new
+	 * set of primitives. Otherwise the existing tree is simply refit to account for
+	 * any transform changes, which is significantly cheaper than a full rebuild. The
+	 * resulting hit set is guaranteed to match that of a full rebuild.
+	 */
+	update() {
+
+		const { objects, idBits, matrixWorld } = this;
+
+		// regenerate the primitive buffer from the current object state and compare
+		// it to the existing one to detect whether the primitive set has changed
+		const primitiveBuffer = new Uint32Array( this._countPrimitives( objects ) );
+		this._fillPrimitiveBuffer( objects, idBits, primitiveBuffer );
+
+		const prevBuffer = this.primitiveBuffer;
+		let changed = primitiveBuffer.length !== prevBuffer.length;
+		for ( let i = 0, l = primitiveBuffer.length; ! changed && i < l; i ++ ) {
+
+			changed = primitiveBuffer[ i ] !== prevBuffer[ i ];
+
+		}
+
+		if ( changed ) {
+
+			// the primitive set changed so the tree must be rebuilt
+			_inverseMatrix.copy( matrixWorld ).invert();
+
+			this.primitiveBuffer = primitiveBuffer;
+			super.init( this._options );
+
+		} else {
+
+			// otherwise a refit is enough to account for any matrix changes
+			this.refit();
+
+		}
 
 	}
 
@@ -220,8 +263,9 @@ export class ObjectBVH extends BVH {
 			},
 			intersectsObject( object, instanceId ) {
 
-				// skip non visible objects
-				if ( ! object.visible ) {
+				// skip non visible objects and objects filtered out by the
+				// raycaster's layers, matching native Raycaster semantics
+				if ( ! object.visible || ! object.layers.test( raycaster.layers ) ) {
 
 					return;
 
